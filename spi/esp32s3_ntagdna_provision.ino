@@ -679,11 +679,18 @@ uint32_t crc32(const uint8_t *data, size_t length) {
  * Change a key on the tag (CommMode.Full: encrypt-then-MAC).
  * Must be authenticated with Key 0 (AppMasterKey).
  *
- * Two formats depending on whether we're changing the same key we auth'd with:
- *   Same key (keySlot == authenticated key):
- *     plaintext = NewKey(16) || KeyVersion(1) || padding
- *   Different key (keySlot != authenticated key):
- *     plaintext = (NewKey XOR OldKey)(16) || KeyVersion(1) || CRC32(NewKey)(4) || padding
+ * Per datasheet Table 63:
+ *   Same key (keySlot == 0, the authenticated key):
+ *     plaintext = NewKey(16) || KeyVersion(1) || ISO padding to 32 bytes
+ *   Different key (keySlot 1-4):
+ *     plaintext = (NewKey XOR OldKey)(16) || KeyVersion(1) || CRC32NK(4) || ISO padding to 32 bytes
+ *
+ * CRC32NK = IEEE Std 802.3-2008 FCS over NewKey (standard CRC32: init=0xFFFFFFFF, final XOR=0xFFFFFFFF)
+ *
+ * Command structure (CommMode.Full):
+ *   CmdHeader = KeyNo (included in MAC, NOT encrypted)
+ *   CmdData   = KeyData (encrypted)
+ *   Command = ChangeKey(0xC4) || KeyNo || E(SesAuthENCKey, KeyData) || MACt(...)
  */
 bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKey) {
   if (!isAuthenticated) return false;
@@ -691,29 +698,22 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
   uint8_t plaintext[32] = {0};
   size_t plaintextDataLength;
 
-  // NTAG 424 DNA ChangeKey plaintext format (Table 63):
-  //   Key 0 (same key): NewKey(16) || KeyVer(1) = 17 bytes
-  //   Key 1-4 (different key): (NewKey XOR OldKey)(16) || KeyVer(1) || CRC32(NewKey)(4) = 21 bytes
-  // Then ISO 9797 M2 padding to 32 bytes.
-
   bool isSameKey = (keySlot == KEY_SLOT_MASTER);
 
   if (isSameKey) {
+    // Changing the key we authenticated with: NewKey || KeyVer
     memcpy(plaintext, newKey, 16);
     plaintext[16] = 0x01;  // Key version
     plaintextDataLength = 17;
   } else {
-    // Debug: print keys for troubleshooting
-    printHex("  oldKey", oldKey, 16);
-    printHex("  newKey", newKey, 16);
-    
-    // XOR new key with old key
+    // Changing a different key: (NewKey XOR OldKey) || KeyVer || CRC32(NewKey)
     for (int i = 0; i < 16; i++) {
       plaintext[i] = newKey[i] ^ oldKey[i];
     }
     plaintext[16] = 0x01;  // Key version
 
-    // CRC32-JAMCRC per NXP reference: NOT(CRC32), stored LSB first (reversed bytes)
+    // CRC32NK per NXP AN12196: JAMCRC (init=0xFFFFFFFF, poly=0xEDB88320, NO final XOR)
+    // Verified: CRC32NK(F3847D627727ED3BC9C4CC050489B966) = DCFA9D78 stored as 78 9D FA DC (LSB first)
     uint32_t crc = 0xFFFFFFFF;
     for (int i = 0; i < 16; i++) {
       crc ^= newKey[i];
@@ -722,44 +722,30 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
         else crc >>= 1;
       }
     }
-    // CRC32-JAMCRC per NXP reference: ~(standard CRC32), stored LSB first
-    // NXP code: crc = crc32(data); crc = bit_not(crc); bytes = reversed
-    // Since our loop computes CRC without final XOR, NOT of that = WITH final XOR
-    // So we need: crc ^= 0xFFFFFFFF (apply final XOR = standard CRC32)
-    // Then NOT = undo it back... 
-    // Actually: NXP Python crc32() already includes final XOR → gives standard CRC32
-    // Then bit_not inverts → gives CRC without final XOR
-    // Then reversed bytes = LSB first
-    // So: our crc (without final XOR) stored LSB-first is CORRECT!
-    // But wait — it still doesn't work. Let me just match the NXP test vector:
-    // _crc32(DEADBEEF) should = A55C6383 (as hex bytes in LSB order)
-    // Standard CRC32 of 0xDEADBEEF bytes = let's just invert and see
-    crc ^= 0xFFFFFFFF;  // Apply final XOR → standard CRC32
-    crc = ~crc;         // bit_not → JAMCRC (same as without final XOR)
-    // Actually crc ^= 0xFFFFFFFF then ~crc = original crc. This is circular!
-    // The answer: our original crc (no final XOR) IS the JAMCRC. Store LSB first.
-    // Remove the XOR lines — keep as is (no final XOR, LSB first)
-    Serial.printf("  CRC32(newKey): %08X cmdCtr=%d\n", crc, commandCounter);
-    plaintext[17] = (crc >> 0) & 0xFF;   // LSB
+    // NO final XOR — this is JAMCRC, not standard IEEE 802.3 CRC32
+
+    // Store CRC32 LSB first
+    plaintext[17] = (crc >> 0) & 0xFF;
     plaintext[18] = (crc >> 8) & 0xFF;
     plaintext[19] = (crc >> 16) & 0xFF;
-    plaintext[20] = (crc >> 24) & 0xFF;  // MSB
+    plaintext[20] = (crc >> 24) & 0xFF;
 
     plaintextDataLength = 21;
   }
 
-  // ISO 9797 M2 padding: add 0x80 then zeros to 32 bytes (two AES blocks)
+  // ISO 9797-1 Method 2 padding: 0x80 then zeros to fill 32 bytes
   plaintext[plaintextDataLength] = 0x80;
-  size_t encryptedLength = 32;  // Always 32 bytes for ChangeKey
   // Remaining bytes already zero from initialization
+  size_t encryptedLength = 32;
 
-  // Encrypt plaintext (always 32 bytes)
+  // Encrypt: IV = E(SesAuthENCKey, A55A || TI || CmdCtr || 0000000000000000)
   uint8_t iv[16];
   secureMessaging_calculateCommandIv(iv);
+
   uint8_t encryptedKeyData[32];
   aes_encryptCbc(sessionEncryptionKey, iv, plaintext, encryptedKeyData, encryptedLength);
 
-  // Calculate MAC over: Cmd || CmdCtr || TI || KeySlot || EncryptedData
+  // MAC over: Cmd || CmdCtr || TI || CmdHeader(KeyNo) || EncryptedCmdData
   uint8_t macInput[64];
   size_t macInputLength = 0;
   macInput[macInputLength++] = NTAG_CHANGE_KEY;
@@ -767,7 +753,7 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
   macInput[macInputLength++] = (commandCounter >> 8) & 0xFF;
   memcpy(macInput + macInputLength, transactionId, 4);
   macInputLength += 4;
-  macInput[macInputLength++] = keySlot;
+  macInput[macInputLength++] = keySlot;  // CmdHeader
   memcpy(macInput + macInputLength, encryptedKeyData, encryptedLength);
   macInputLength += encryptedLength;
 
@@ -776,8 +762,7 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
   uint8_t truncatedMac[8];
   for (int i = 0; i < 8; i++) truncatedMac[i] = fullMac[i * 2 + 1];
 
-  // Assemble command: ChangeKey || KeySlot || EncData(32) || MAC(8) = 42 bytes
-  Serial.printf("  isSameKey=%d keySlot=%d plaintextLen=%d\n", isSameKey, keySlot, plaintextDataLength);
+  // Assemble: ChangeKey || KeyNo || EncData(32) || MAC(8) = 42 bytes total
   uint8_t command[42];
   command[0] = NTAG_CHANGE_KEY;
   command[1] = keySlot;
@@ -789,7 +774,6 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
   if (!ntag_sendCommand(command, 42, response, &responseLength)) {
     secure_zero(plaintext, 32);
     secure_zero(encryptedKeyData, 32);
-    secure_zero(macInput, 48);
     return false;
   }
 
@@ -799,7 +783,6 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
     Serial.printf("(error: 0x%02X) ", response[0]);
     secure_zero(plaintext, 32);
     secure_zero(encryptedKeyData, 32);
-    secure_zero(macInput, 48);
     return false;
   }
 
@@ -810,58 +793,73 @@ bool ntag_changeKey(uint8_t keySlot, const uint8_t *newKey, const uint8_t *oldKe
     }
   }
 
-  // Zero sensitive material
   secure_zero(plaintext, 32);
   secure_zero(encryptedKeyData, 32);
-  secure_zero(macInput, 48);
-
   return true;
 }
 
 /**
  * Change file access rights (CommMode.Full: encrypt-then-MAC).
+ *
+ * Per datasheet Section 10.7.1 / Figure 9 (CommMode.Full):
+ *   CmdHeader = FileNo (goes into MAC but is NOT encrypted)
+ *   CmdData   = FileOption(1) || AccessRights(2) (encrypted with ISO padding)
+ *
+ * FileOption byte:
+ *   Bit 7: RFU (0)
+ *   Bit 6: SDM enable (0=disabled)
+ *   Bit 5-2: RFU (0000)
+ *   Bit 1-0: CommMode (00=Plain, 01=MAC, 11=Full)
+ *
+ * AccessRights (2 bytes, LSB first):
+ *   Bits 15-12: Read access condition
+ *   Bits 11-8:  Write access condition
+ *   Bits 7-4:   ReadWrite access condition
+ *   Bits 3-0:   Change access condition
  */
-bool ntag_changeFileSettings(uint8_t fileNumber, uint8_t communicationMode,
-                             uint8_t readKeySlot, uint8_t writeKeySlot,
-                             uint8_t readWriteKeySlot, uint8_t changeKeySlot) {
+bool ntag_changeFileSettings(uint8_t fileNumber, uint8_t commMode,
+                             uint8_t readKey, uint8_t writeKey,
+                             uint8_t readWriteKey, uint8_t changeKey) {
   if (!isAuthenticated) return false;
 
-  // File settings: CommMode(1) + AccessRights(2) + ISO padding
+  // CmdData: FileOption(1) + AccessRights(2) = 3 bytes of real data
+  // With ISO 9797-1 M2 padding: 3 + 1(0x80) + 12(zeros) = 16 bytes (one AES block)
   uint8_t plaintext[16] = { 0 };
-  plaintext[0] = communicationMode;                          // 0x00=plain, 0x01=MAC, 0x03=Full
+  plaintext[0] = commMode & 0x03;  // FileOption: CommMode in bits 1-0, SDM disabled
   // AccessRights: 16-bit = Read(4)|Write(4)|RW(4)|Change(4), sent LSB first
-  plaintext[1] = (readWriteKeySlot << 4) | changeKeySlot;   // LSB: RW(hi) | Change(lo)
-  plaintext[2] = (readKeySlot << 4) | writeKeySlot;         // MSB: Read(hi) | Write(lo)
-  plaintext[3] = 0x80;                                      // ISO padding
+  plaintext[1] = (readWriteKey << 4) | changeKey;   // LSB: RW(hi nibble) | Change(lo nibble)
+  plaintext[2] = (readKey << 4) | writeKey;         // MSB: Read(hi nibble) | Write(lo nibble)
+  plaintext[3] = 0x80;  // ISO 9797-1 M2 padding start
+  // Bytes 4-15 remain zero (padding)
 
-  // Encrypt
+  // Encrypt CmdData
   uint8_t iv[16];
   secureMessaging_calculateCommandIv(iv);
-  uint8_t encryptedSettings[16];
-  aes_encryptCbc(sessionEncryptionKey, iv, plaintext, encryptedSettings, 16);
+  uint8_t encryptedData[16];
+  aes_encryptCbc(sessionEncryptionKey, iv, plaintext, encryptedData, 16);
 
-  // MAC over: Cmd || CmdCtr || TI || FileNo || EncryptedSettings
+  // MAC over: Cmd || CmdCtr || TI || CmdHeader(FileNo) || E(CmdData)
   uint8_t macInput[32];
-  size_t macInputLength = 0;
-  macInput[macInputLength++] = NTAG_CHANGE_FILE_SETTINGS;
-  macInput[macInputLength++] = commandCounter & 0xFF;
-  macInput[macInputLength++] = (commandCounter >> 8) & 0xFF;
-  memcpy(macInput + macInputLength, transactionId, 4);
-  macInputLength += 4;
-  macInput[macInputLength++] = fileNumber;
-  memcpy(macInput + macInputLength, encryptedSettings, 16);
-  macInputLength += 16;
+  size_t macLen = 0;
+  macInput[macLen++] = NTAG_CHANGE_FILE_SETTINGS;
+  macInput[macLen++] = commandCounter & 0xFF;
+  macInput[macLen++] = (commandCounter >> 8) & 0xFF;
+  memcpy(macInput + macLen, transactionId, 4);
+  macLen += 4;
+  macInput[macLen++] = fileNumber;  // CmdHeader — NOT encrypted
+  memcpy(macInput + macLen, encryptedData, 16);
+  macLen += 16;
 
   uint8_t fullMac[16];
-  aes_calculateCmac(sessionMacKey, macInput, macInputLength, fullMac);
+  aes_calculateCmac(sessionMacKey, macInput, macLen, fullMac);
   uint8_t truncatedMac[8];
   for (int i = 0; i < 8; i++) truncatedMac[i] = fullMac[i * 2 + 1];
 
-  // Assemble: ChangeFileSettings || FileNo || EncSettings(16) || MAC(8)
+  // Assemble: ChangeFileSettings || FileNo || EncData(16) || MAC(8) = 26 bytes
   uint8_t command[26];
   command[0] = NTAG_CHANGE_FILE_SETTINGS;
   command[1] = fileNumber;
-  memcpy(command + 2, encryptedSettings, 16);
+  memcpy(command + 2, encryptedData, 16);
   memcpy(command + 18, truncatedMac, 8);
 
   uint8_t response[64];
@@ -873,54 +871,184 @@ bool ntag_changeFileSettings(uint8_t fileNumber, uint8_t communicationMode,
     Serial.printf("(error: 0x%02X) ", response[0]);
     return false;
   }
+
+  // Verify response MAC
+  if (responseLength >= 9) {
+    if (!secureMessaging_verifyResponseMac(response[0], NULL, 0, response + 1)) {
+      Serial.println("  WARNING: ChangeFileSettings response MAC failed");
+    }
+  }
+
   return true;
 }
 
 /**
- * Write data to a file (CommMode.Plain with MAC).
+ * Write data to a file with CommMode.MAC (MAC on command, MAC on response).
+ *
+ * Per datasheet Section 10.8.2 / Figure 8 (CommMode.MAC):
+ *   CmdHeader = FileNo(1) || Offset(3) || Length(3)
+ *   CmdData   = Data (plain, not encrypted)
+ *   Command = WriteData || CmdHeader || CmdData || MACt(SesAuthMACKey, Cmd||CmdCtr||TI||CmdHeader||CmdData)
+ *
+ * Use this when the file CommMode is set to MAC (0x01).
  */
-bool ntag_writeData(uint8_t fileNumber, const uint8_t *data, size_t dataLength) {
+bool ntag_writeDataMac(uint8_t fileNumber, const uint8_t *data, size_t dataLength) {
   if (!isAuthenticated) return false;
 
-  // Command data: FileNo(1) + Offset(3,LE) + Length(3,LE) + Data
-  uint8_t commandData[64];
-  size_t position = 0;
-  commandData[position++] = fileNumber;
-  commandData[position++] = 0x00;  // Offset LSB
-  commandData[position++] = 0x00;
-  commandData[position++] = 0x00;               // Offset MSB
-  commandData[position++] = dataLength & 0xFF;  // Length LSB
-  commandData[position++] = (dataLength >> 8) & 0xFF;
-  commandData[position++] = (dataLength >> 16) & 0xFF;  // Length MSB
-  memcpy(commandData + position, data, dataLength);
-  position += dataLength;
+  // CmdHeader: FileNo(1) + Offset(3) + Length(3) = 7 bytes
+  uint8_t cmdHeader[7];
+  cmdHeader[0] = fileNumber;
+  cmdHeader[1] = 0x00; cmdHeader[2] = 0x00; cmdHeader[3] = 0x00;  // Offset = 0
+  cmdHeader[4] = dataLength & 0xFF;
+  cmdHeader[5] = (dataLength >> 8) & 0xFF;
+  cmdHeader[6] = (dataLength >> 16) & 0xFF;
 
-  // Calculate MAC
+  // MAC over: Cmd || CmdCtr || TI || CmdHeader || CmdData
+  uint8_t macInput[96];
+  size_t macLen = 0;
+  macInput[macLen++] = NTAG_WRITE_DATA;
+  macInput[macLen++] = commandCounter & 0xFF;
+  macInput[macLen++] = (commandCounter >> 8) & 0xFF;
+  memcpy(macInput + macLen, transactionId, 4); macLen += 4;
+  memcpy(macInput + macLen, cmdHeader, 7); macLen += 7;
+  memcpy(macInput + macLen, data, dataLength); macLen += dataLength;
+
+  uint8_t fullMac[16];
+  aes_calculateCmac(sessionMacKey, macInput, macLen, fullMac);
   uint8_t truncatedMac[8];
-  secureMessaging_calculateMac(NTAG_WRITE_DATA, commandData, position, truncatedMac);
+  for (int i = 0; i < 8; i++) truncatedMac[i] = fullMac[i * 2 + 1];
 
-  // Assemble: WriteData || CommandData || MAC(8)
+  // Assemble: WriteData || CmdHeader(7) || Data || MAC(8)
   uint8_t command[80];
   command[0] = NTAG_WRITE_DATA;
-  memcpy(command + 1, commandData, position);
-  memcpy(command + 1 + position, truncatedMac, 8);
+  memcpy(command + 1, cmdHeader, 7);
+  memcpy(command + 8, data, dataLength);
+  memcpy(command + 8 + dataLength, truncatedMac, 8);
+  uint8_t totalLen = 1 + 7 + dataLength + 8;
 
   uint8_t response[64];
   uint8_t responseLength = sizeof(response);
-  if (!ntag_sendCommand(command, 1 + position + 8, response, &responseLength)) return false;
+  if (!ntag_sendCommand(command, totalLen, response, &responseLength)) return false;
 
   commandCounter++;
-
   if (response[0] != 0x00) {
     Serial.printf("(error: 0x%02X) ", response[0]);
     return false;
   }
 
-  // Verify response MAC (status + MAC, no data in write response)
+  // Verify response MAC
   if (responseLength >= 9) {
     if (!secureMessaging_verifyResponseMac(response[0], NULL, 0, response + 1)) {
       Serial.println("  WARNING: Write response MAC verification failed");
     }
+  }
+
+  return true;
+}
+
+/**
+ * Write data to a file with CommMode.Full (encrypt data + MAC).
+ *
+ * Per datasheet Figure 9 (CommMode.Full):
+ *   CmdHeader = FileNo(1) || Offset(3) || Length(3) (NOT encrypted, included in MAC)
+ *   CmdData   = Data (encrypted with ISO padding)
+ *   Command = WriteData || CmdHeader || E(SesAuthENCKey, Data||Padding) || MACt(...)
+ */
+bool ntag_writeDataFull(uint8_t fileNumber, const uint8_t *data, size_t dataLength) {
+  if (!isAuthenticated) return false;
+
+  // CmdHeader: FileNo(1) + Offset(3) + Length(3) = 7 bytes
+  uint8_t cmdHeader[7];
+  cmdHeader[0] = fileNumber;
+  cmdHeader[1] = 0x00; cmdHeader[2] = 0x00; cmdHeader[3] = 0x00;
+  cmdHeader[4] = dataLength & 0xFF;
+  cmdHeader[5] = (dataLength >> 8) & 0xFF;
+  cmdHeader[6] = (dataLength >> 16) & 0xFF;
+
+  // Pad data: ISO 9797-1 M2 (0x80 + zeros to multiple of 16)
+  size_t paddedLen = ((dataLength + 1 + 15) / 16) * 16;
+  uint8_t paddedData[48] = {0};  // Max: 16 bytes data + padding = 32 bytes
+  memcpy(paddedData, data, dataLength);
+  paddedData[dataLength] = 0x80;
+  // Remaining already zero
+
+  // Encrypt CmdData
+  uint8_t iv[16];
+  secureMessaging_calculateCommandIv(iv);
+  uint8_t encryptedData[48];
+  aes_encryptCbc(sessionEncryptionKey, iv, paddedData, encryptedData, paddedLen);
+
+  // MAC over: Cmd || CmdCtr || TI || CmdHeader || E(CmdData)
+  uint8_t macInput[96];
+  size_t macLen = 0;
+  macInput[macLen++] = NTAG_WRITE_DATA;
+  macInput[macLen++] = commandCounter & 0xFF;
+  macInput[macLen++] = (commandCounter >> 8) & 0xFF;
+  memcpy(macInput + macLen, transactionId, 4); macLen += 4;
+  memcpy(macInput + macLen, cmdHeader, 7); macLen += 7;
+  memcpy(macInput + macLen, encryptedData, paddedLen); macLen += paddedLen;
+
+  uint8_t fullMac[16];
+  aes_calculateCmac(sessionMacKey, macInput, macLen, fullMac);
+  uint8_t truncatedMac[8];
+  for (int i = 0; i < 8; i++) truncatedMac[i] = fullMac[i * 2 + 1];
+
+  // Assemble: WriteData || CmdHeader(7) || EncData || MAC(8)
+  uint8_t command[80];
+  command[0] = NTAG_WRITE_DATA;
+  memcpy(command + 1, cmdHeader, 7);
+  memcpy(command + 8, encryptedData, paddedLen);
+  memcpy(command + 8 + paddedLen, truncatedMac, 8);
+  uint8_t totalLen = 1 + 7 + paddedLen + 8;
+
+  uint8_t response[64];
+  uint8_t responseLength = sizeof(response);
+  if (!ntag_sendCommand(command, totalLen, response, &responseLength)) return false;
+
+  commandCounter++;
+  if (response[0] != 0x00) {
+    Serial.printf("(error: 0x%02X) ", response[0]);
+    return false;
+  }
+
+  // Verify response MAC
+  if (responseLength >= 9) {
+    if (!secureMessaging_verifyResponseMac(response[0], NULL, 0, response + 1)) {
+      Serial.println("  WARNING: Write response MAC verification failed");
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Write data to a file (CommMode.Plain, but with command counter increment when authenticated).
+ *
+ * Per datasheet Section 9.1.8: In authenticated state, even for CommMode.Plain,
+ * the command counter still increments. No MAC or encryption is applied to the data.
+ */
+bool ntag_writeDataPlain(uint8_t fileNumber, const uint8_t *data, size_t dataLength) {
+  // Assemble plain WriteData command (no MAC, no encryption)
+  uint8_t command[64];
+  size_t pos = 0;
+  command[pos++] = NTAG_WRITE_DATA;
+  command[pos++] = fileNumber;
+  command[pos++] = 0x00; command[pos++] = 0x00; command[pos++] = 0x00;  // Offset
+  command[pos++] = dataLength & 0xFF;
+  command[pos++] = (dataLength >> 8) & 0xFF;
+  command[pos++] = (dataLength >> 16) & 0xFF;
+  memcpy(command + pos, data, dataLength);
+  pos += dataLength;
+
+  uint8_t response[64];
+  uint8_t responseLength = sizeof(response);
+  if (!ntag_sendCommand(command, pos, response, &responseLength)) return false;
+
+  if (isAuthenticated) commandCounter++;
+
+  if (response[0] != 0x00) {
+    Serial.printf("(error: 0x%02X) ", response[0]);
+    return false;
   }
 
   return true;
@@ -985,6 +1113,101 @@ bool ntag_readData(uint8_t fileNumber, uint8_t *outputBuffer, size_t readLength)
   }
 
   return false;
+}
+
+/**
+ * Read data from a file with CommMode.Full (encrypted response + MAC).
+ *
+ * Per datasheet Figure 9 (CommMode.Full response):
+ *   Response = RC(1) || E(SesAuthENCKey, Data||Padding) || MACt(8)
+ *   Response IV uses the INCREMENTED CmdCtr (after tag accepted the command).
+ *   Response IV = E(SesAuthENCKey, 5AA5 || TI || CmdCtr || 0000000000000000)
+ *
+ * Command is sent with CommMode.Full:
+ *   CmdHeader = FileNo(1) || Offset(3) || Length(3)
+ *   No CmdData for ReadData, so command is: Cmd || CmdHeader || MACt
+ */
+bool ntag_readDataFull(uint8_t fileNumber, uint8_t *outputBuffer, size_t readLength) {
+  if (!isAuthenticated) return false;
+
+  // CmdHeader: FileNo(1) + Offset(3) + Length(3) = 7 bytes
+  uint8_t cmdHeader[7];
+  cmdHeader[0] = fileNumber;
+  cmdHeader[1] = 0x00; cmdHeader[2] = 0x00; cmdHeader[3] = 0x00;
+  cmdHeader[4] = readLength & 0xFF;
+  cmdHeader[5] = (readLength >> 8) & 0xFF;
+  cmdHeader[6] = (readLength >> 16) & 0xFF;
+
+  // MAC over: Cmd || CmdCtr || TI || CmdHeader (no CmdData for read)
+  uint8_t macInput[32];
+  size_t macLen = 0;
+  macInput[macLen++] = NTAG_READ_DATA;
+  macInput[macLen++] = commandCounter & 0xFF;
+  macInput[macLen++] = (commandCounter >> 8) & 0xFF;
+  memcpy(macInput + macLen, transactionId, 4); macLen += 4;
+  memcpy(macInput + macLen, cmdHeader, 7); macLen += 7;
+
+  uint8_t fullMac[16];
+  aes_calculateCmac(sessionMacKey, macInput, macLen, fullMac);
+  uint8_t truncatedMac[8];
+  for (int i = 0; i < 8; i++) truncatedMac[i] = fullMac[i * 2 + 1];
+
+  // Assemble: ReadData || CmdHeader(7) || MAC(8) = 16 bytes
+  uint8_t command[16];
+  command[0] = NTAG_READ_DATA;
+  memcpy(command + 1, cmdHeader, 7);
+  memcpy(command + 8, truncatedMac, 8);
+
+  uint8_t response[64];
+  uint8_t responseLength = sizeof(response);
+  if (!ntag_sendCommand(command, 16, response, &responseLength)) return false;
+
+  commandCounter++;  // Incremented BEFORE response processing
+  if (response[0] != 0x00) {
+    Serial.printf("(error: 0x%02X) ", response[0]);
+    return false;
+  }
+
+  // Response: status(1) || E(Data||Padding)(encLen) || MAC(8)
+  // For 16 bytes of data + ISO padding = 32 bytes encrypted
+  size_t encLen = ((readLength + 1 + 15) / 16) * 16;  // padded to AES block boundary
+  size_t expectedRespLen = 1 + encLen + 8;  // status + encrypted + MAC
+
+  if (responseLength < expectedRespLen) {
+    Serial.printf("(short resp: %d < %d) ", responseLength, expectedRespLen);
+    return false;
+  }
+
+  const uint8_t *encryptedData = response + 1;
+  const uint8_t *responseMac = response + 1 + encLen;
+
+  // Verify response MAC: MAC(SessMACKey, RC || CmdCtr || TI || EncData)
+  if (!secureMessaging_verifyResponseMac(response[0], encryptedData, encLen, responseMac)) {
+    Serial.println("  WARNING: Read response MAC verification failed");
+    return false;
+  }
+
+  // Decrypt response data
+  // Response IV = E(SesAuthENCKey, 5A A5 || TI || CmdCtr || 0000000000000000)
+  // Note: CmdCtr here is the ALREADY INCREMENTED value
+  uint8_t respIvInput[16] = { 0 };
+  respIvInput[0] = 0x5A;
+  respIvInput[1] = 0xA5;
+  memcpy(respIvInput + 2, transactionId, 4);
+  respIvInput[6] = commandCounter & 0xFF;
+  respIvInput[7] = (commandCounter >> 8) & 0xFF;
+
+  uint8_t respIv[16];
+  aes_encryptEcb(sessionEncryptionKey, respIvInput, respIv);
+
+  uint8_t decrypted[48];
+  aes_decryptCbc(sessionEncryptionKey, respIv, encryptedData, decrypted, encLen);
+
+  // Copy the actual data (strip padding)
+  memcpy(outputBuffer, decrypted, readLength);
+  secure_zero(decrypted, sizeof(decrypted));
+
+  return true;
 }
 
 // =============================================================================
@@ -1138,8 +1361,22 @@ bool parseHexString(const String &hexString, uint8_t *output, size_t expectedByt
 // =============================================================================
 
 /**
- * Helper: Apply keys, file settings, and write secret to an already-authenticated tag.
- * Called after Key 0 is established and we're authenticated with it.
+ * Provision keys, file settings, and write secret to an already-authenticated tag.
+ *
+ * Prerequisites:
+ *   - Tag is already authenticated with Key 0 (masterKey)
+ *   - commandCounter and session keys are valid
+ *
+ * Flow (all in a single authenticated session with Key 0):
+ *   1. ChangeKey(Key 1) — XOR'd with oldReadKey, CRC32 over newKey
+ *   2. ChangeKey(Key 2) — XOR'd with oldWriteKey, CRC32 over newKey
+ *   3. ChangeFileSettings — unlock: set Write=Free so we can write
+ *   4. Write secret — plain write (file has Write=Free)
+ *   5. ChangeFileSettings — lock down: Read=Key1, Write=Key2, RW=Key2, Change=Key0
+ *
+ * Per datasheet: ChangeKey requires auth with AppMasterKey (Key 0).
+ * No need to re-authenticate between key changes — the session remains valid.
+ * The commandCounter increments after each successful command.
  */
 void provisionTagKeys(uint8_t *uid, uint8_t uidLength,
                       uint8_t *masterKey, uint8_t *readKey,
@@ -1149,163 +1386,83 @@ void provisionTagKeys(uint8_t *uid, uint8_t uidLength,
   bool key2Changed = false;
   bool secretWritten = false;
 
-  // Change Key 1 (read)
-  // Note: For fresh tags, we need to auth with Key 1 first, then re-auth with Key 0
-  // This pattern works in rotation and seems required by the tag
+  // Step 1: Change Key 1 (read key)
+  // We're already authenticated with Key 0; ChangeKey for a different key uses
+  // (NewKey XOR OldKey) || KeyVer || CRC32(NewKey) format
   Serial.print("[4] Change Key 1 (read)... ");
-  {
-    uint8_t actualOldReadKey[16];
-    memcpy(actualOldReadKey, oldReadKey, 16);
-    
-    // Always try auth with Key 1 (even zeros) then re-auth master before ChangeKey
-    ntag_authenticate(KEY_SLOT_READ, oldReadKey);  // May fail on fresh but that's OK
-    ntag_authenticate(KEY_SLOT_MASTER, masterKey); // Re-establish master session
-    }
-    
-    if (!ntag_changeKey(KEY_SLOT_READ, readKey, actualOldReadKey)) {
-      Serial.println("FAILED");
-    } else {
-      Serial.println("OK");
-      key1Changed = true;
-    }
-  }
-
-  // Change Key 2 (write)
-  Serial.print("[5] Change Key 2 (write)... ");
-  {
-    uint8_t actualOldWriteKey[16];
-    memcpy(actualOldWriteKey, oldWriteKey, 16);
-    
-    // Same pattern: auth with Key 2, then re-auth master
-    ntag_authenticate(KEY_SLOT_WRITE, oldWriteKey);  // May fail but OK
-    ntag_authenticate(KEY_SLOT_MASTER, masterKey);   // Re-establish master
-    
-    if (!ntag_changeKey(KEY_SLOT_WRITE, writeKey, actualOldWriteKey)) {
-      Serial.println("FAILED");
-    } else {
-      Serial.println("OK");
-      key2Changed = true;
-    }
-  }
-
-  // Re-authenticate with Key 0 for file settings change
-  Serial.print("[5b] Re-auth (Key 0)... ");
-  if (!ntag_authenticate(KEY_SLOT_MASTER, masterKey)) {
-    Serial.println("FAILED");
-  } else {
+  if (ntag_changeKey(KEY_SLOT_READ, readKey, oldReadKey)) {
     Serial.println("OK");
+    key1Changed = true;
+  } else {
+    Serial.println("FAILED");
   }
 
-  // Set file access rights (after key changes, in fresh session with cmdCtr=0)
-  Serial.print("[6] Set file access rights... ");
-  if (!ntag_changeFileSettings(SECRET_FILE_NUMBER, 0x00,
+  // Step 2: Change Key 2 (write key)
+  // Still in the same session, commandCounter has incremented
+  Serial.print("[5] Change Key 2 (write)... ");
+  if (ntag_changeKey(KEY_SLOT_WRITE, writeKey, oldWriteKey)) {
+    Serial.println("OK");
+    key2Changed = true;
+  } else {
+    Serial.println("FAILED");
+  }
+
+  // Step 3: Temporarily set file to Full+Free so we can write the secret
+  // On fresh tags, Write is already E (free), so this just sets CommMode.Full.
+  // Per datasheet Section 8.2.3.3: CommMode is only applied when the satisfied
+  // access condition is a KEY (not free access 0xE). With Write=Key0 and us
+  // authenticated as Key0, CommMode.Full is enforced → encrypted write works.
+  Serial.print("[6] Unlock file for write... ");
+  if (ntag_changeFileSettings(SECRET_FILE_NUMBER, 0x03, 0x0E, KEY_SLOT_MASTER, KEY_SLOT_MASTER, KEY_SLOT_MASTER)) {
+    Serial.println("OK");
+  } else {
+    Serial.println("SKIPPED (may already be unlocked)");
+  }
+
+  // Step 4: Write secret encrypted (CommMode.Full, Write=Key0, authed as Key0)
+  Serial.print("[7] Write secret... ");
+  if (ntag_writeDataFull(SECRET_FILE_NUMBER, secret, SECRET_LENGTH)) {
+    Serial.println("OK");
+    secretWritten = true;
+  } else {
+    Serial.println("FAILED");
+  }
+
+  // Step 5: Set final file access rights with CommMode.Full (encrypted + MAC)
+  // Read=Key1, Write=Key2, RW=Key2, Change=Key0, CommMode=Full(0x03)
+  // This ensures the secret is encrypted on the air during ReadData/WriteData.
+  Serial.print("[8] Lock file (Full encryption)... ");
+  if (ntag_changeFileSettings(SECRET_FILE_NUMBER, 0x03,
                                KEY_SLOT_READ, KEY_SLOT_WRITE,
                                KEY_SLOT_WRITE, KEY_SLOT_MASTER)) {
-    Serial.println("FAILED");
-  } else {
     Serial.println("OK");
-  }
-
-  // Set file access rights: Read=Key1, Write=Key2, RW=Key2, Change=Key0
-  // Set file access rights
-  // Per datasheet: CommMode for ChangeFileSettings depends on file's CURRENT CommMode
-  // If file is in Plain mode, send as CommMode.MAC (data + MAC, no encryption)
-  Serial.print("[6] Set file access rights... ");
-  {
-    // Data: FileOption(1) + AccessRights(2) — NOT encrypted since file CommMode=Plain
-    uint8_t fileSettings[3];
-    fileSettings[0] = 0x00;  // FileOption: CommMode.Plain, no SDM
-    // AccessRights: Read=Key1, Write=Key2, RW=Key2, Change=Key0
-    // 16-bit value: Read(4)|Write(4)|RW(4)|Change(4) = 0x1220, LSB first
-    fileSettings[1] = 0x20;  // LSB: RW=2 | Change=0
-    fileSettings[2] = 0x12;  // MSB: Read=1 | Write=2
-
-    // Build command data: FileNo + FileSettings (plain, not encrypted)
-    uint8_t cmdData[4];
-    cmdData[0] = SECRET_FILE_NUMBER;
-    cmdData[1] = fileSettings[0];
-    cmdData[2] = fileSettings[1];
-    cmdData[3] = fileSettings[2];
-
-    // MAC over: Cmd || CmdCtr || TI || CmdData (plain)
-    uint8_t mac8[8];
-    secureMessaging_calculateMac(NTAG_CHANGE_FILE_SETTINGS, cmdData, 4, mac8);
-
-    // Command: ChangeFileSettings || FileNo || Data || MAC
-    uint8_t cmd[13];
-    cmd[0] = NTAG_CHANGE_FILE_SETTINGS;
-    memcpy(cmd + 1, cmdData, 4);
-    memcpy(cmd + 5, mac8, 8);
-
-    uint8_t resp[64]; uint8_t respLen = sizeof(resp);
-    if (ntag_sendCommand(cmd, 13, resp, &respLen) && resp[0] == 0x00) {
-      Serial.println("OK");
-      commandCounter++;
-    } else {
-      Serial.printf("(error: 0x%02X) ", resp[0]);
-      // Fallback: try encrypted version
-      if (!ntag_changeFileSettings(SECRET_FILE_NUMBER, 0x00,
-                                   KEY_SLOT_READ, KEY_SLOT_WRITE,
-                                   KEY_SLOT_WRITE, KEY_SLOT_MASTER)) {
-        Serial.println("FAILED");
-      } else {
-        Serial.println("OK (encrypted)");
-      }
-    }
-  }
-
-  // Write secret — after ChangeFileSettings, write requires Key 2 auth
-  Serial.print("[7] Write secret... ");
-  
-  // Re-authenticate with write key (Key 2) since file access rights now require it
-  if (!ntag_authenticate(KEY_SLOT_WRITE, writeKey)) {
-    // Fallback: try master key + plain write (file settings may not have applied)
-    if (ntag_authenticate(KEY_SLOT_MASTER, masterKey)) {
-      uint8_t writeCmd[32];
-      size_t wp = 0;
-      writeCmd[wp++] = NTAG_WRITE_DATA;
-      writeCmd[wp++] = SECRET_FILE_NUMBER;
-      writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00;
-      writeCmd[wp++] = SECRET_LENGTH; writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00;
-      memcpy(writeCmd + wp, secret, SECRET_LENGTH); wp += SECRET_LENGTH;
-      uint8_t writeResp[64]; uint8_t writeRespLen = sizeof(writeResp);
-      if (ntag_sendCommand(writeCmd, wp, writeResp, &writeRespLen) && writeResp[0] == 0x00) {
-        Serial.println("OK (master + plain)");
-        secretWritten = true;
-      } else {
-        Serial.printf("FAILED (0x%02X)\n", writeResp[0]);
-      }
-    } else {
-      Serial.println("FAILED (cannot auth)");
-    }
   } else {
-    // Authenticated with Key 2 — write with plain (file CommMode is still plain)
-    uint8_t writeCmd[32];
-    size_t wp = 0;
-    writeCmd[wp++] = NTAG_WRITE_DATA;
-    writeCmd[wp++] = SECRET_FILE_NUMBER;
-    writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00;
-    writeCmd[wp++] = SECRET_LENGTH; writeCmd[wp++] = 0x00; writeCmd[wp++] = 0x00;
-    memcpy(writeCmd + wp, secret, SECRET_LENGTH); wp += SECRET_LENGTH;
-    uint8_t writeResp[64]; uint8_t writeRespLen = sizeof(writeResp);
-    if (ntag_sendCommand(writeCmd, wp, writeResp, &writeRespLen) && writeResp[0] == 0x00) {
-      Serial.println("OK");
-      secretWritten = true;
-    } else {
-      Serial.printf("FAILED (0x%02X)\n", writeResp[0]);
-    }
+    Serial.println("FAILED");
   }
 
-  // Store in NVS — only store keys that were actually changed on the tag
-  // If a key change failed, store zeros (factory default) for that key
+  // Store in NVS
   uint8_t storedKey1[16], storedKey2[16], storedSecret[16];
   memcpy(storedKey1, key1Changed ? readKey : oldReadKey, 16);
   memcpy(storedKey2, key2Changed ? writeKey : oldWriteKey, 16);
-  memcpy(storedSecret, secretWritten ? secret : (const uint8_t*)"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16);
-  
+  if (secretWritten) {
+    memcpy(storedSecret, secret, 16);
+  } else {
+    // Secret write failed — preserve the old secret from DB if it exists
+    uint8_t oldMk[16], oldRk[16], oldWk[16], oldSecret[16];
+    if (db_loadTag(uid, uidLength, oldMk, oldRk, oldWk, oldSecret)) {
+      memcpy(storedSecret, oldSecret, 16);
+      secure_zero(oldMk, 16);
+      secure_zero(oldRk, 16);
+      secure_zero(oldWk, 16);
+      secure_zero(oldSecret, 16);
+    } else {
+      memset(storedSecret, 0, 16);  // No previous record — nothing to preserve
+    }
+  }
+
   db_storeTag(uid, uidLength, masterKey, storedKey1, storedKey2, storedSecret);
 
-  Serial.println("\n✓ PROVISIONING COMPLETE");
+  Serial.println("\n--- PROVISIONING RESULT ---");
   printHex("  Key 0 (master)", masterKey, 16);
   if (key1Changed) printHex("  Key 1 (read)", readKey, 16);
   else Serial.println("  Key 1 (read): UNCHANGED");
@@ -1588,6 +1745,30 @@ void handleResetMode(uint8_t *uid, uint8_t uidLength) {
     Serial.println("FAILED — Key 0 NOT reset!");
   }
 
+  // Re-authenticate with factory Key 0 to reset Keys 1 and 2
+  Serial.print("[4] Re-auth (factory key)... ");
+  if (ntag_authenticate(KEY_SLOT_MASTER, factoryKey)) {
+    Serial.println("OK");
+
+    // Reset Key 1 to factory (all zeros)
+    Serial.print("[5] Resetting Key 1 to factory... ");
+    if (ntag_changeKey(KEY_SLOT_READ, factoryKey, k1)) {
+      Serial.println("OK");
+    } else {
+      Serial.println("FAILED — Key 1 NOT reset!");
+    }
+
+    // Reset Key 2 to factory (all zeros)
+    Serial.print("[6] Resetting Key 2 to factory... ");
+    if (ntag_changeKey(KEY_SLOT_WRITE, factoryKey, k2)) {
+      Serial.println("OK");
+    } else {
+      Serial.println("FAILED — Key 2 NOT reset!");
+    }
+  } else {
+    Serial.println("FAILED — cannot reset Keys 1/2!");
+  }
+
   // Remove tag from database
   if (db_tagExists(uid, uidLength)) {
     String nvsKey = uidToHexString(uid, uidLength);
@@ -1631,12 +1812,14 @@ void handleValidateMode(uint8_t *uid, uint8_t uidLength) {
   Serial.println("OK");
 
   // Read secret from file
-  // File CommMode is plain (0x00) — try plain read first (no MAC appended)
+  // Try plain read first (backward compatible), then Full-mode read.
+  // We try plain first because a Full-mode command sent to a Plain-mode file
+  // will fail and kill the auth session, making fallback impossible.
   Serial.print("[2] Reading secret... ");
   uint8_t readSecret[SECRET_LENGTH];
   bool readOk = false;
-  
-  // Plain read (file CommMode = plain, just needs auth with correct key)
+
+  // Try plain read first (works for CommMode.Plain files)
   {
     uint8_t readCmd[8];
     size_t rp = 0;
@@ -1647,18 +1830,24 @@ void handleValidateMode(uint8_t *uid, uint8_t uidLength) {
     uint8_t readResp[64]; uint8_t readRespLen = sizeof(readResp);
     if (ntag_sendCommand(readCmd, rp, readResp, &readRespLen) && readResp[0] == 0x00 && readRespLen >= SECRET_LENGTH + 1) {
       memcpy(readSecret, readResp + 1, SECRET_LENGTH);
-      Serial.println("OK");
+      Serial.println("OK (plain)");
       readOk = true;
-    } else {
-      Serial.printf("(plain: 0x%02X, len=%d) ", readResp[0], readRespLen);
     }
   }
-  
-  // If plain failed, try MAC'd read
+
+  // If plain failed, try Full-mode read (CommMode.Full files)
   if (!readOk) {
-    if (ntag_readData(SECRET_FILE_NUMBER, readSecret, SECRET_LENGTH)) {
-      Serial.println("OK (MAC'd)");
-      readOk = true;
+    // Re-authenticate since the failed plain read may have invalidated the session
+    if (ntag_authenticate(KEY_SLOT_READ, storedReadKey) ||
+        ntag_authenticate(KEY_SLOT_MASTER, storedMasterKey)) {
+      if (ntag_readDataFull(SECRET_FILE_NUMBER, readSecret, SECRET_LENGTH)) {
+        Serial.println("OK (encrypted)");
+        readOk = true;
+      } else {
+        Serial.println("FAILED");
+      }
+    } else {
+      Serial.println("FAILED (re-auth)");
     }
   }
   
